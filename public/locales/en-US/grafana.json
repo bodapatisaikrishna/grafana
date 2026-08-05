@@ -12506,6 +12506,10 @@
     }
   },
   "nav": {
+    "access-policies": {
+      "subtitle": "Use policies to control automated access to metrics, logs, traces, and other Grafana Cloud services",
+      "title": "Access policies"
+    },
     "add-new-connections": {
       "title": "Add new connection"
     },
