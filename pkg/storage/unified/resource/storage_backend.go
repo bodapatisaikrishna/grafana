@@ -1315,6 +1315,100 @@ func (k *kvStorageBackend) ReadResource(ctx context.Context, req *resourcepb.Rea
 	}
 }
 
+func (k *kvStorageBackend) BatchReadResource(ctx context.Context, requests []*resourcepb.ReadRequest) ([]*BackendReadResponse, error) {
+	responses := make([]*BackendReadResponse, len(requests))
+	type batchReadEntry struct {
+		index int
+		key   kv.DataKey
+	}
+	entries := make([]batchReadEntry, 0, len(requests))
+	keys := make([]kv.DataKey, 0, len(requests))
+
+	for i, req := range requests {
+		if req == nil || req.Key == nil {
+			responses[i] = &BackendReadResponse{Error: NewBadRequestError("missing key")}
+			continue
+		}
+
+		rv := ToSnowflakeRV(req.ResourceVersion)
+		name := req.Key.Name
+		getKey := GetRequestKey{
+			Group:     req.Key.Group,
+			Resource:  req.Key.Resource,
+			Namespace: req.Key.Namespace,
+			Name:      name,
+		}
+		meta, err := k.dataStore.GetResourceKeyAtRevision(ctx, getKey, rv)
+		if errors.Is(err, ErrNotFound) {
+			responses[i] = &BackendReadResponse{Error: NewNotFoundError(req.Key)}
+			continue
+		}
+		if err != nil {
+			responses[i] = &BackendReadResponse{Error: &resourcepb.ErrorResult{Code: http.StatusInternalServerError, Message: err.Error()}}
+			continue
+		}
+
+		dataKey := kv.DataKey{
+			Group:           req.Key.Group,
+			Resource:        req.Key.Resource,
+			Namespace:       req.Key.Namespace,
+			Name:            name,
+			ResourceVersion: meta.ResourceVersion,
+			Action:          meta.Action,
+			Folder:          meta.Folder,
+			GUID:            meta.GUID,
+		}
+		entries = append(entries, batchReadEntry{index: i, key: dataKey})
+		keys = append(keys, dataKey)
+	}
+
+	if len(keys) == 0 {
+		return responses, nil
+	}
+
+	values := make(map[string][]byte, len(keys))
+	var batchErr error
+	for obj, err := range k.dataStore.BatchGet(ctx, keys) {
+		if err != nil {
+			batchErr = err
+			break
+		}
+		value, err := readAndClose(obj.Value)
+		if err != nil {
+			batchErr = err
+			break
+		}
+		values[obj.Key.String()] = value
+	}
+
+	for _, entry := range entries {
+		// A late batch failure must not discard values already read.
+		if value, ok := values[entry.key.String()]; ok {
+			responses[entry.index] = &BackendReadResponse{
+				Key:             requests[entry.index].Key,
+				ResourceVersion: entry.key.ResourceVersion,
+				Value:           value,
+				Folder:          entry.key.Folder,
+			}
+			continue
+		}
+		msg := "resource data not found"
+		if batchErr != nil {
+			msg = batchErr.Error()
+		}
+		// Folder/RV must be set: authorization runs before the error surfaces, and an
+		// empty folder would let folder-scoped perms deny the row and hide the error.
+		responses[entry.index] = &BackendReadResponse{
+			Key:             requests[entry.index].Key,
+			ResourceVersion: entry.key.ResourceVersion,
+			Folder:          entry.key.Folder,
+			Error:           &resourcepb.ErrorResult{Code: http.StatusInternalServerError, Message: msg},
+		}
+	}
+
+	return responses, nil
+}
+
 // ListIterator returns an iterator for listing resources.
 func (k *kvStorageBackend) ListIterator(ctx context.Context, req *resourcepb.ListRequest, cb func(ListIterator) error) (rv int64, err error) {
 	if req.Options == nil || req.Options.Key == nil {
