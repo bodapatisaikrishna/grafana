@@ -46,7 +46,7 @@ func isRetriablePatchError(err error) bool {
 func rejectSpecPatchOps(patchOperations []map[string]interface{}) error {
 	for _, op := range patchOperations {
 		path, _ := op["path"].(string)
-		if strings.HasPrefix(path, "/spec/") {
+		if strings.HasPrefix(path, "/spec") {
 			return fmt.Errorf("refusing to patch spec through a status subresource: op %v targets %q", op, path)
 		}
 	}

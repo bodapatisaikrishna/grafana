@@ -163,6 +163,13 @@ func (g *genericStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	newMeta.SetLabels(oldMeta.GetLabels())
 	newMeta.SetFinalizers(oldMeta.GetFinalizers())
 	newMeta.SetOwnerReferences(oldMeta.GetOwnerReferences())
+
+	// A status-subresource update must never change spec. Without this, a
+	// PATCH against /status whose ops also touch /spec would persist that
+	// spec change
+	if spec, err := oldMeta.GetSpec(); err == nil {
+		_ = newMeta.SetSpec(spec)
+	}
 }
 
 func (g *genericStatusStrategy) AllowCreateOnUpdate(ctx context.Context) bool {

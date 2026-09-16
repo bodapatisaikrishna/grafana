@@ -977,7 +977,7 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 		var specOps, statusOps []map[string]interface{}
 		for _, op := range ops {
 			path, _ := op["path"].(string)
-			if path == "/spec" || strings.HasPrefix(path, "/spec/") {
+			if strings.HasPrefix(path, "/spec") {
 				specOps = append(specOps, op)
 			} else {
 				statusOps = append(statusOps, op)
