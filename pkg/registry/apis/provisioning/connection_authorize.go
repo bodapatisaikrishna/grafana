@@ -2,6 +2,7 @@ package provisioning
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -9,7 +10,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/registry/rest"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/grafana/grafana-app-sdk/logging"
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
@@ -119,23 +122,38 @@ func (c *connectionAuthorizeConnector) Connect(ctx context.Context, name string,
 			tokenStatus.Expiration = token.ExpiresAt.UnixMilli()
 		}
 
-		patcher := appcontroller.NewConnectionStatusPatcher(c.access.GetClient())
-		patchOps := []map[string]any{
-			{
-				"op":   "add",
-				"path": "/secure/token",
-				"value": map[string]string{
-					"create": string(token.Token),
-				},
-			},
-			{
-				"op":    "add",
-				"path":  "/status/token",
-				"value": tokenStatus,
+		secureOp := map[string]any{
+			"op":   "add",
+			"path": "/secure/token",
+			"value": map[string]string{
+				"create": string(token.Token),
 			},
 		}
-		if err := patcher.Patch(ctx, conn, patchOps...); err != nil {
+		securePatch, err := json.Marshal([]map[string]any{secureOp})
+		if err != nil {
+			logger.Error("failed to marshal token patch", "error", err)
+			responder.Error(apierrors.NewInternalError(errors.New("failed to store the connection token")))
+			return
+		}
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			_, err := c.access.GetClient().Connections(conn.Namespace).
+				Patch(ctx, conn.Name, types.JSONPatchType, securePatch, metav1.PatchOptions{})
+			return err
+		})
+		if err != nil {
 			logger.Error("failed to store connection token", "error", err)
+			responder.Error(apierrors.NewInternalError(errors.New("failed to store the connection token")))
+			return
+		}
+
+		patcher := appcontroller.NewConnectionStatusPatcher(c.access.GetClient())
+		statusOp := map[string]any{
+			"op":    "add",
+			"path":  "/status/token",
+			"value": tokenStatus,
+		}
+		if err := patcher.Patch(ctx, conn, statusOp); err != nil {
+			logger.Error("failed to store connection token status", "error", err)
 			responder.Error(apierrors.NewInternalError(errors.New("failed to store the connection token")))
 			return
 		}
