@@ -214,3 +214,17 @@ func TestConnectionStatusPatcher_Patch_RetriesOnConflict(t *testing.T) {
 		require.Equal(t, int32(2), calls.Load(), "patch should retry once after SQLITE_BUSY")
 	})
 }
+
+func TestConnectionStatusPatcher_Patch_RejectsSpecOps(t *testing.T) {
+	client := fake.FakeProvisioningV0alpha1{Fake: &k8testing.Fake{}}
+	patcher := NewConnectionStatusPatcher(&client)
+
+	conn := &provisioning.Connection{ObjectMeta: metav1.ObjectMeta{Name: "test-connection", Namespace: "test-namespace"}}
+	err := patcher.Patch(context.Background(), conn,
+		map[string]interface{}{"op": "replace", "path": "/spec/github/appID", "value": ""},
+	)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "refusing to patch spec")
+	require.Empty(t, client.Actions(), "no request should reach the apiserver when a spec op is smuggled in")
+}

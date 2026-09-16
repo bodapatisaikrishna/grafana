@@ -26,6 +26,10 @@ func NewConnectionStatusPatcher(client client.ProvisioningV0alpha1Interface) *Co
 
 // Patch applies JSON patch operations to a Connection's status subresource.
 func (p *ConnectionStatusPatcher) Patch(ctx context.Context, conn *provisioning.Connection, patchOperations ...map[string]interface{}) error {
+	if err := rejectSpecPatchOps(patchOperations); err != nil {
+		return err
+	}
+
 	patch, err := json.Marshal(patchOperations)
 	if err != nil {
 		return fmt.Errorf("unable to marshal patch data: %w", err)

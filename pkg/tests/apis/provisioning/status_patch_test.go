@@ -60,9 +60,9 @@ func waitForConditionTypes[T any](t *testing.T, resource *apis.K8sResourceClient
 // Previously, we ran mutation and validation hooks on every update (both on the resource, or subresource - including)
 // the status. If there was an error on the mutation hook, this would prevent status updates.
 //
-// This appends a unique condition type the connection controller never touches, rather than
+// This appends a unique condition type the repository controller never touches, rather than
 // writing status.health directly - the controller owns that field and reconciles it
-// concurrently (via its own health check against the connection), so asserting an exact
+// concurrently (via its own health check against the repository), so asserting an exact
 // value there would race the controller's own writes.
 func TestIntegrationProvisioning_RepositoryStatusPatch_SurvivesInvalidSpecMutation(t *testing.T) {
 	if testing.Short() {
@@ -122,6 +122,11 @@ func TestIntegrationProvisioning_RepositoryStatusPatch_SurvivesInvalidSpecMutati
 	found := common.FindCondition(repo.Status.Conditions, condition.Type)
 	require.NotNil(t, found, "status condition should have been written by the combined patch")
 	require.Equal(t, metav1.ConditionTrue, found.Status)
+
+	// The smuggled /spec/git/branch op must not have been persisted: a
+	// status-subresource write can never change spec, regardless of what the
+	// patch request itself contains.
+	require.Equal(t, "main", repo.Spec.Git.Branch, "spec must be unchanged by a status subresource patch")
 }
 
 // Test that status patches still succeed even if the mutation would fail.
@@ -204,4 +209,9 @@ func TestIntegrationProvisioning_ConnectionStatusPatch_SurvivesInvalidSpecMutati
 	found := common.FindCondition(conn.Status.Conditions, condition.Type)
 	require.NotNil(t, found, "status condition should have been written by the combined patch")
 	require.Equal(t, metav1.ConditionTrue, found.Status)
+
+	// The smuggled /spec/github/appID op must not have been persisted: a
+	// status-subresource write can never change spec, regardless of what the
+	// patch request itself contains.
+	require.Equal(t, "123456", conn.Spec.GitHub.AppID, "spec must be unchanged by a status subresource patch")
 }

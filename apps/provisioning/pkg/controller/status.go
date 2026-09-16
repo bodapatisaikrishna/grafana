@@ -43,7 +43,21 @@ func isRetriablePatchError(err error) bool {
 	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
+func rejectSpecPatchOps(patchOperations []map[string]interface{}) error {
+	for _, op := range patchOperations {
+		path, _ := op["path"].(string)
+		if strings.HasPrefix(path, "/spec/") {
+			return fmt.Errorf("refusing to patch spec through a status subresource: op %v targets %q", op, path)
+		}
+	}
+	return nil
+}
+
 func (r *RepositoryStatusPatcher) Patch(ctx context.Context, repo *provisioning.Repository, patchOperations ...map[string]interface{}) error {
+	if err := rejectSpecPatchOps(patchOperations); err != nil {
+		return err
+	}
+
 	patch, err := json.Marshal(patchOperations)
 	if err != nil {
 		return fmt.Errorf("unable to marshal patch data: %w", err)

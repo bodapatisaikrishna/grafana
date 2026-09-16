@@ -214,3 +214,79 @@ func TestRepositoryStatusPatcher_Patch_RetriesOnConflict(t *testing.T) {
 		require.Equal(t, int32(2), calls.Load(), "patch should retry once after SQLITE_BUSY")
 	})
 }
+
+func TestRejectSpecPatchOps(t *testing.T) {
+	tests := []struct {
+		name    string
+		ops     []map[string]interface{}
+		wantErr bool
+	}{
+		{
+			name: "status op only",
+			ops: []map[string]interface{}{
+				{"op": "replace", "path": "/status/health", "value": true},
+			},
+		},
+		{
+			name: "secure op only",
+			ops: []map[string]interface{}{
+				{"op": "add", "path": "/secure/token", "value": map[string]interface{}{"create": "x"}},
+			},
+		},
+		{
+			name: "status and secure together",
+			ops: []map[string]interface{}{
+				{"op": "replace", "path": "/status/health", "value": true},
+				{"op": "add", "path": "/secure/webhookSecret", "value": map[string]interface{}{"create": "x"}},
+			},
+		},
+		{
+			name: "spec op is rejected",
+			ops: []map[string]interface{}{
+				{"op": "replace", "path": "/spec/git/branch", "value": "main"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "spec op mixed with a legitimate status op is still rejected",
+			ops: []map[string]interface{}{
+				{"op": "replace", "path": "/status/health", "value": true},
+				{"op": "replace", "path": "/spec/github/appID", "value": ""},
+			},
+			wantErr: true,
+		},
+		{
+			name: "bare /spec path is rejected",
+			ops: []map[string]interface{}{
+				{"op": "replace", "path": "/spec", "value": map[string]interface{}{}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rejectSpecPatchOps(tt.ops)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "refusing to patch spec")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRepositoryStatusPatcher_Patch_RejectsSpecOps(t *testing.T) {
+	client := fake.FakeProvisioningV0alpha1{Fake: &k8testing.Fake{}}
+	patcher := NewRepositoryStatusPatcher(&client)
+
+	repo := &provisioning.Repository{ObjectMeta: metav1.ObjectMeta{Name: "test-repo", Namespace: "test-namespace"}}
+	err := patcher.Patch(context.Background(), repo,
+		map[string]interface{}{"op": "replace", "path": "/spec/git/branch", "value": "main"},
+	)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "refusing to patch spec")
+	require.Empty(t, client.Actions(), "no request should reach the apiserver when a spec op is smuggled in")
+}

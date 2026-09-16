@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -972,14 +973,46 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 		}
 		ops := patchOperations
 		patchOperations = nil
-		patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_status",
-			repoSpanAttrs(obj),
-			trace.WithAttributes(attribute.Int("patch.operations", len(ops))),
-		)
-		defer patchSpan.End()
-		if patchErr := rc.statusPatcher.Patch(patchCtx, obj, ops...); patchErr != nil {
-			return fmt.Errorf("status patch operations failed: %w", patchErr)
+
+		var specOps, statusOps []map[string]interface{}
+		for _, op := range ops {
+			path, _ := op["path"].(string)
+			if path == "/spec" || strings.HasPrefix(path, "/spec/") {
+				specOps = append(specOps, op)
+			} else {
+				statusOps = append(statusOps, op)
+			}
 		}
+
+		// Spec ops are applied first: a failed spec write (e.g. the repoID
+		// backfill's `test` op losing a stale-URL race) must not let this
+		// pass's status write - notably /status/observedGeneration - land
+		// anyway, or hasSpecChanged would go false and the backfill would
+		// not be retried on the very next reconcile.
+		if len(specOps) > 0 {
+			patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_spec",
+				repoSpanAttrs(obj),
+				trace.WithAttributes(attribute.Int("patch.operations", len(specOps))),
+			)
+			patchErr := rc.patchSpecOps(patchCtx, obj, specOps...)
+			patchSpan.End()
+			if patchErr != nil {
+				return fmt.Errorf("spec patch operations failed: %w", patchErr)
+			}
+		}
+
+		if len(statusOps) > 0 {
+			patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_status",
+				repoSpanAttrs(obj),
+				trace.WithAttributes(attribute.Int("patch.operations", len(statusOps))),
+			)
+			patchErr := rc.statusPatcher.Patch(patchCtx, obj, statusOps...)
+			patchSpan.End()
+			if patchErr != nil {
+				return fmt.Errorf("status patch operations failed: %w", patchErr)
+			}
+		}
+
 		return nil
 	}
 	defer func() {
@@ -1333,6 +1366,20 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 	}
 
 	return repoType, nil
+}
+
+func (rc *RepositoryController) patchSpecOps(ctx context.Context, obj *provisioning.Repository, ops ...map[string]interface{}) error {
+	patch, err := json.Marshal(ops)
+	if err != nil {
+		return fmt.Errorf("unable to marshal spec patch data: %w", err)
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		_, err := rc.client.Repositories(obj.GetNamespace()).
+			Patch(ctx, obj.Name, types.JSONPatchType, patch, v1.PatchOptions{
+				FieldManager: "provisioning-controller",
+			})
+		return err
+	})
 }
 
 // processHooks handles hook execution with intelligent retry logic. `suppressed`

@@ -35,6 +35,7 @@ import (
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
 	"github.com/grafana/grafana/apps/provisioning/pkg/connection"
 	provisioningv0alpha1 "github.com/grafana/grafana/apps/provisioning/pkg/generated/applyconfiguration/provisioning/v0alpha1"
+	fakeclientset "github.com/grafana/grafana/apps/provisioning/pkg/generated/clientset/versioned/fake"
 	client "github.com/grafana/grafana/apps/provisioning/pkg/generated/clientset/versioned/typed/provisioning/v0alpha1"
 	listers "github.com/grafana/grafana/apps/provisioning/pkg/generated/listers/provisioning/v0alpha1"
 	"github.com/grafana/grafana/apps/provisioning/pkg/quotas"
@@ -1266,42 +1267,21 @@ func (s *repoIDHandlerStub) Test(context.Context) (*provisioning.TestResults, er
 func (s *repoIDHandlerStub) ResolvedRepoID() string   { return s.resolvedID }
 func (s *repoIDHandlerStub) ShouldUpdateRepoID() bool { return s.shouldUpdate }
 
-// raceSimulatingPatcher approximates the apiserver's atomic JSON Patch
-// application (see k8s.io/apiserver/pkg/endpoints/handlers/patch.go,
-// jsonPatcher.applyJSPatch): all operations are evaluated against a single
-// storage snapshot, and if any "test" operation fails, none of the patch's
-// other operations are applied. This lets tests exercise what happens when a
-// stale reconciliation's precondition no longer holds, without needing the
-// real evanphx/json-patch dependency in this package.
-type raceSimulatingPatcher struct {
-	storage *provisioning.Repository
+// countingStatusPatcher is a StatusPatcher that never fails, never inspects
+// its arguments, and records how many times Patch was called. Repository ID
+// backfill (like the default-branch backfill) is a spec write, and goes to
+// the main resource via rc.client instead of rc.statusPatcher - so this
+// test's fake clientset (which correctly implements RFC 6902 "test" op
+// semantics via evanphx/json-patch) is what simulates the race, not the
+// status patcher. The call count instead proves the ordering invariant in
+// applyPatches: a failed spec patch must short-circuit before the status
+// patch (e.g. the /status/observedGeneration bump) is ever attempted.
+type countingStatusPatcher struct {
+	calls atomic.Int32
 }
 
-func (p *raceSimulatingPatcher) Patch(_ context.Context, _ *provisioning.Repository, patchOperations ...map[string]interface{}) error {
-	for _, op := range patchOperations {
-		if op["op"] != "test" {
-			continue
-		}
-		path, _ := op["path"].(string)
-		if path == "/spec/gitlab/url" {
-			var currentURL string
-			if p.storage.Spec.GitLab != nil {
-				currentURL = p.storage.Spec.GitLab.URL
-			}
-			if currentURL != op["value"] {
-				return apierrors.NewGenericServerResponse(
-					http.StatusUnprocessableEntity, "", schema.GroupResource{}, "",
-					fmt.Sprintf("test operation on %s failed", path), 0, false)
-			}
-		}
-	}
-
-	for _, op := range patchOperations {
-		if op["op"] == "add" && op["path"] == "/spec/gitlab/repoID" && p.storage.Spec.GitLab != nil {
-			p.storage.Spec.GitLab.RepoID, _ = op["value"].(string)
-		}
-	}
-
+func (p *countingStatusPatcher) Patch(context.Context, *provisioning.Repository, ...map[string]interface{}) error {
+	p.calls.Add(1)
 	return nil
 }
 
@@ -1370,7 +1350,12 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 			require.NoError(t, indexer.Add(observed))
 			repoLister := listers.NewRepositoryLister(indexer)
 
-			patcher := &raceSimulatingPatcher{storage: storage}
+			// Repo ID backfill is a spec write and goes through rc.client
+			// (the main resource), not rc.statusPatcher. Seeding the fake
+			// clientset with `storage` and letting its real JSON Patch
+			// application (RFC 6902 "test" op semantics) evaluate the patch
+			// is what simulates the race here.
+			fakeClientset := fakeclientset.NewSimpleClientset(storage)
 
 			healthMetrics := NewMockHealthMetricsRecorder(t)
 			healthMetrics.EXPECT().
@@ -1378,6 +1363,7 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 				Maybe()
 
 			tester := repository.NewTester()
+			patcher := &countingStatusPatcher{}
 			healthChecker := NewRepositoryHealthChecker(patcher, tester, healthMetrics)
 
 			mockRepo := &repoIDHandlerStub{
@@ -1397,6 +1383,7 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 
 			repoGetter := informer.NewCachedRepositoryGetter(repoLister)
 			rc := &RepositoryController{
+				client:        fakeClientset.ProvisioningV0alpha1(),
 				repos:         repoGetter,
 				quotaGetter:   quotas.NewFixedQuotaGetter(provisioning.QuotaStatus{}),
 				quotaChecker:  NewRepositoryQuotaChecker(repoGetter),
@@ -1416,12 +1403,24 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 				require.NoError(t, err)
 			}
 
+			updated, getErr := fakeClientset.ProvisioningV0alpha1().Repositories(namespace).
+				Get(context.Background(), repoName, metav1.GetOptions{})
+			require.NoError(t, getErr)
+
 			if tc.wantRepoIDSet {
-				assert.Equal(t, "resolved-for-a", storage.Spec.GitLab.RepoID,
+				assert.Equal(t, "resolved-for-a", updated.Spec.GitLab.RepoID,
 					"repoID should be backfilled when the url has not changed")
 			} else {
-				assert.Empty(t, storage.Spec.GitLab.RepoID,
+				assert.Empty(t, updated.Spec.GitLab.RepoID,
 					"a stale reconciliation must not pin a repoID resolved for a different url")
+			}
+
+			if tc.wantErr {
+				assert.Equal(t, int32(0), patcher.calls.Load(),
+					"a failed spec patch must prevent the status patch (e.g. the observedGeneration bump) from being applied this pass")
+			} else {
+				assert.Greater(t, patcher.calls.Load(), int32(0),
+					"a successful spec patch should be followed by the status patch")
 			}
 		})
 	}
