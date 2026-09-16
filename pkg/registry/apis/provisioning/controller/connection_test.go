@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	testingclock "k8s.io/utils/clock/testing"
@@ -26,6 +28,7 @@ import (
 	"github.com/grafana/grafana-app-sdk/logging"
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
 	"github.com/grafana/grafana/apps/provisioning/pkg/connection"
+	fakeclientset "github.com/grafana/grafana/apps/provisioning/pkg/generated/clientset/versioned/fake"
 	listers "github.com/grafana/grafana/apps/provisioning/pkg/generated/listers/provisioning/v0alpha1"
 	common "github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
 	"github.com/grafana/grafana/pkg/infra/tracing"
@@ -46,6 +49,9 @@ func TestConnectionController_process(t *testing.T) {
 		conn          *provisioning.Connection
 		expectError   bool
 		errorContains string
+		// wantSecureToken, when set, asserts that the main resource (never
+		// statusPatcher) received a /secure/token patch with this "create" value.
+		wantSecureToken string
 	}{
 		{
 			name: "deletion timestamp - skip without error",
@@ -260,7 +266,7 @@ func TestConnectionController_process(t *testing.T) {
 						},
 					}, nil)
 				mockStatusPatcher.EXPECT().Patch(
-					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 				).Return(nil)
 
 				return mockLister, mockHealthChecker, mockStatusPatcher, mockFactory
@@ -292,7 +298,8 @@ func TestConnectionController_process(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
+			expectError:     false,
+			wantSecureToken: "new-token",
 		},
 		{
 			name: "token not expired and not regenerated as it's new",
@@ -558,19 +565,7 @@ func TestConnectionController_process(t *testing.T) {
 						},
 					}, nil)
 				mockStatusPatcher.EXPECT().Patch(
-					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-				).Run(
-					func(ctx context.Context, conn *provisioning.Connection, patchOperations ...map[string]interface{}) {
-						found := false
-						for _, op := range patchOperations {
-							if op["op"].(string) == "replace" &&
-								op["path"].(string) == "/secure/token" &&
-								op["value"].(map[string]string)["create"] == "someToken" {
-								found = true
-							}
-						}
-						require.True(t, found)
-					},
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 				).Return(nil)
 
 				return mockLister, mockHealthChecker, mockStatusPatcher, mockFactory
@@ -597,7 +592,8 @@ func TestConnectionController_process(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
+			expectError:     false,
+			wantSecureToken: "someToken",
 		},
 		{
 			name: "token expired but health check not needed",
@@ -661,22 +657,7 @@ func TestConnectionController_process(t *testing.T) {
 						},
 					}, nil)
 				mockStatusPatcher.EXPECT().Patch(
-					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-				).Run(
-					func(ctx context.Context, conn *provisioning.Connection, patchOperations ...map[string]interface{}) {
-						// Verify token regeneration patch operation exists
-						tokenFound := false
-						for _, op := range patchOperations {
-							if op["op"].(string) == "replace" &&
-								op["path"].(string) == "/secure/token" {
-								value := op["value"].(map[string]string)
-								if value["create"] == "new-token" {
-									tokenFound = true
-								}
-							}
-						}
-						require.True(t, tokenFound, "Token should be regenerated when expired even if health check not needed")
-					},
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 				).Return(nil)
 
 				return mockLister, mockHealthChecker, mockStatusPatcher, mockFactory
@@ -703,7 +684,8 @@ func TestConnectionController_process(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
+			expectError:     false,
+			wantSecureToken: "new-token",
 		},
 		{
 			name: "health check failure",
@@ -901,7 +883,11 @@ func TestConnectionController_process(t *testing.T) {
 							Type: provisioning.GithubConnectionType,
 						},
 						Secure: provisioning.ConnectionSecure{
-							// No token - IsZero() will return true
+							// Token missing (IsZero()), but PrivateKey already set - a
+							// GitHub App connection always has its private key configured
+							// before a token is ever generated, so /secure is never
+							// actually empty by the time the token write happens.
+							PrivateKey: common.InlineSecureValue{Name: "existing-private-key"},
 						},
 					},
 				}
@@ -950,7 +936,8 @@ func TestConnectionController_process(t *testing.T) {
 					Type: provisioning.GithubConnectionType,
 				},
 				Secure: provisioning.ConnectionSecure{
-					// No token
+					// Token missing, but PrivateKey already set - see setupMocks above.
+					PrivateKey: common.InlineSecureValue{Name: "existing-private-key"},
 				},
 			},
 			expectError: false,
@@ -1015,19 +1002,7 @@ func TestConnectionController_process(t *testing.T) {
 						},
 					}, nil)
 				mockStatusPatcher.EXPECT().Patch(
-					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-				).Run(
-					func(ctx context.Context, conn *provisioning.Connection, patchOperations ...map[string]interface{}) {
-						found := false
-						for _, op := range patchOperations {
-							if op["op"].(string) == "replace" &&
-								op["path"].(string) == "/secure/token" &&
-								op["value"].(map[string]string)["create"] == "new-token" {
-								found = true
-							}
-						}
-						require.True(t, found, "Token should be regenerated when invalid")
-					},
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 				).Return(nil)
 
 				return mockLister, mockHealthChecker, mockStatusPatcher, mockFactory
@@ -1054,7 +1029,8 @@ func TestConnectionController_process(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
+			expectError:     false,
+			wantSecureToken: "new-token",
 		},
 		{
 			name: "token generation error - continues with health check",
@@ -1216,16 +1192,32 @@ func TestConnectionController_process(t *testing.T) {
 					Name:      "test-conn",
 					Namespace: "default",
 				},
+				Spec: provisioning.ConnectionSpec{
+					Type: provisioning.GithubConnectionType,
+					GitHub: &provisioning.GitHubConnectionConfig{
+						AppID:          "123",
+						InstallationID: "456",
+					},
+				},
+				// Mirrors mockLister.conn above: the orphaned reference already made
+				// /secure non-empty, so /secure is never actually missing by the time
+				// the regenerated token gets written.
+				Secure: provisioning.ConnectionSecure{
+					Token: common.InlineSecureValue{Name: "orphaned-token"},
+				},
 			},
-			expectError: false,
+			expectError:     false,
+			wantSecureToken: "new-token",
 		},
 	}
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			mockLister, mockHealthChecker, mockStatusPatcher, mockFactory := tt.setupMocks()
+			fakeClientset := fakeclientset.NewSimpleClientset(tt.conn)
 			cc := &ConnectionController{
 				conns:             informer.NewCachedConnectionGetter(mockLister),
+				client:            fakeClientset.ProvisioningV0alpha1(),
 				healthChecker:     mockHealthChecker,
 				statusPatcher:     mockStatusPatcher,
 				connectionFactory: mockFactory,
@@ -1246,6 +1238,10 @@ func TestConnectionController_process(t *testing.T) {
 				assert.NoError(t, err)
 			}
 
+			if tt.wantSecureToken != "" {
+				assert.Equal(t, tt.wantSecureToken, findSecureTokenPatch(t, fakeClientset), "expected /secure/token to be patched on the main resource")
+			}
+
 			// Assert all mock expectations were met
 			if mockHealthChecker != nil {
 				mockHealthChecker.AssertExpectations(t)
@@ -1258,6 +1254,133 @@ func TestConnectionController_process(t *testing.T) {
 			}
 		})
 	}
+}
+
+// findSecureTokenPatch returns the "create" value of the /secure/token (or
+// /secure) patch op sent through the fake clientset - i.e. the main resource,
+// never statusPatcher - during the test.
+func findSecureTokenPatch(t *testing.T, fakeClientset *fakeclientset.Clientset) string {
+	t.Helper()
+	for _, action := range fakeClientset.Actions() {
+		patchAction, ok := action.(k8stesting.PatchAction)
+		if !ok || patchAction.GetResource().Resource != "connections" {
+			continue
+		}
+		if create := findSecureTokenInPatchBytes(t, patchAction.GetPatch()); create != "" {
+			return create
+		}
+	}
+	return ""
+}
+
+// findSecureTokenInPatchBytes returns the "create" value of the /secure/token
+// (or /secure) op within a raw JSON Patch document.
+func findSecureTokenInPatchBytes(t *testing.T, patch []byte) string {
+	t.Helper()
+	if patch == nil {
+		return ""
+	}
+	var ops []map[string]interface{}
+	require.NoError(t, json.Unmarshal(patch, &ops))
+	for _, op := range ops {
+		path, _ := op["path"].(string)
+		value, ok := op["value"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if path == "/secure/token" {
+			if create, ok := value["create"].(string); ok {
+				return create
+			}
+		}
+		if path == "/secure" {
+			token, ok := value["token"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if create, ok := token["create"].(string); ok {
+				return create
+			}
+		}
+	}
+	return ""
+}
+
+// TestConnectionController_process_MainPatchFailureBlocksStatusPatch verifies
+// that when the main-resource write (e.g. /secure/token) fails, the status
+// write (e.g. /status/token's LastUpdated/expiration) is never attempted
+// either. Without this, status could claim a token refresh that never
+// actually landed, and a later reconcile trusting that timestamp would back
+// off instead of retrying the write.
+func TestConnectionController_process_MainPatchFailureBlocksStatusPatch(t *testing.T) {
+	conn := &provisioning.Connection{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-conn",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Status: provisioning.ConnectionStatus{
+			ObservedGeneration: 1,
+			Health: provisioning.HealthStatus{
+				Healthy: true,
+				Checked: time.Now().Add(-10 * time.Minute).UnixMilli(),
+			},
+		},
+		Spec: provisioning.ConnectionSpec{
+			Type: provisioning.GithubConnectionType,
+		},
+		Secure: provisioning.ConnectionSecure{
+			Token: common.InlineSecureValue{Name: "existing-token"},
+		},
+	}
+
+	mockLister := &mockConnectionLister{conn: conn}
+	mockHealthChecker := NewMockConnectionHealthChecker(t)
+	mockFactory := connection.NewMockFactory(t)
+	mockConnection := connection.NewMockConnection(t)
+	mockTokenConnection := connection.NewMockTokenConnection(t)
+	mockConnWithToken := &mockConnectionWithToken{
+		Connection:      mockConnection,
+		TokenConnection: mockTokenConnection,
+	}
+
+	mockHealthChecker.EXPECT().ShouldCheckHealth(mock.Anything).Return(true)
+	mockFactory.EXPECT().Build(mock.Anything, mock.Anything).Return(mockConnWithToken, nil)
+	// Token expires in 2 minutes - triggers regeneration.
+	mockTokenConnection.EXPECT().ValidateToken().Return(time.Now().Add(2*time.Minute), nil)
+	mockTokenConnection.EXPECT().GenerateConnectionToken(mock.Anything).Return(&connection.ExpirableSecureValue{Token: "new-token"}, nil)
+	mockHealthChecker.EXPECT().RefreshHealthWithPatchOps(mock.Anything, mock.Anything).Return(
+		ConnectionHealthResultWithPatchOps{
+			TestResults:  &provisioning.TestResults{Success: true},
+			HealthStatus: provisioning.HealthStatus{Healthy: true, Checked: time.Now().UnixMilli()},
+		}, nil,
+	)
+
+	// No expectations set on Patch: the test fails immediately if it's ever
+	// called, since the main-resource write below must block it.
+	mockStatusPatcher := NewMockConnectionStatusPatcher(t)
+
+	// Not seeded with conn, so the main-resource Patch fails with NotFound.
+	fakeClientset := fakeclientset.NewSimpleClientset()
+
+	cc := &ConnectionController{
+		conns:             informer.NewCachedConnectionGetter(mockLister),
+		client:            fakeClientset.ProvisioningV0alpha1(),
+		healthChecker:     mockHealthChecker,
+		statusPatcher:     mockStatusPatcher,
+		connectionFactory: mockFactory,
+		logger:            logging.DefaultLogger,
+		resyncInterval:    5 * time.Minute,
+		tracer:            tracing.InitializeTracerForTest(),
+	}
+
+	err := cc.process(t.Context(), "default/test-conn")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "main resource patch operations failed")
+
+	mockHealthChecker.AssertExpectations(t)
+	mockFactory.AssertExpectations(t)
+	mockStatusPatcher.AssertExpectations(t)
 }
 
 func TestConnectionController_process_FieldErrors(t *testing.T) {
@@ -1392,6 +1515,7 @@ func TestConnectionController_process_FieldErrors(t *testing.T) {
 			// Create controller
 			cc := &ConnectionController{
 				conns:             informer.NewCachedConnectionGetter(mockLister),
+				client:            fakeclientset.NewSimpleClientset().ProvisioningV0alpha1(),
 				connectionFactory: mockFactory,
 				healthChecker:     mockHealthChecker,
 				statusPatcher:     mockPatcher,
@@ -1528,7 +1652,7 @@ func TestConnectionController_shouldGenerateToken_BackfillsExpiredFromLiveExpiry
 func newConnectionControllerForQueueTest(t *testing.T) (*ConnectionController, *prometheus.Registry) {
 	t.Helper()
 	reg := prometheus.NewPedanticRegistry()
-	cc := NewConnectionController(nil, nil, nil, nil, time.Minute, 5*time.Second, reg, nil, false)
+	cc := NewConnectionController(nil, nil, nil, nil, nil, time.Minute, 5*time.Second, reg, nil, false)
 	t.Cleanup(cc.queue.ShutDown)
 	return cc, reg
 }
@@ -2057,7 +2181,7 @@ func TestConnectionController_WorkerQueueWaitHistogram(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	cc := NewConnectionController(
-		nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
 		time.Minute, 30*time.Second,
 		reg,
 		nil,
@@ -2086,7 +2210,7 @@ func TestConnectionController_WorkerQueueSizeGauge(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	cc := NewConnectionController(
-		nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
 		time.Minute, 30*time.Second,
 		reg,
 		nil,

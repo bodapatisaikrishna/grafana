@@ -981,29 +981,32 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 			return nil
 		}
 
-		var specOps, statusOps []map[string]interface{}
+		var mainOps, statusOps []map[string]interface{}
 		for _, op := range ops {
 			path, _ := op["path"].(string)
-			if strings.HasPrefix(path, "/spec") {
-				specOps = append(specOps, op)
-			} else {
+			if strings.HasPrefix(path, "/status") {
 				statusOps = append(statusOps, op)
+			} else {
+				mainOps = append(mainOps, op)
 			}
 		}
 
-		// Spec ops are applied first: if spec write fails, we shouldn't update the observedGeneration
-		// otherwise on the next reconciliation, hasSpecChanged will be false even though it wasn't updated.
-		if len(specOps) > 0 {
-			patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_spec",
+		var errs []error
+
+		// Applied before statusOps: if this write fails, we shouldn't update the
+		// observedGeneration, otherwise on the next reconciliation, hasSpecChanged
+		// will be false even though the spec change wasn't actually persisted.
+		if len(mainOps) > 0 {
+			patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_main",
 				repoSpanAttrs(obj),
-				trace.WithAttributes(attribute.Int("patch.operations", len(specOps))),
+				trace.WithAttributes(attribute.Int("patch.operations", len(mainOps))),
 			)
-			patched, patchErr := rc.patchSpecOps(patchCtx, obj, specOps...)
+			patched, patchErr := rc.patchMainResourceOps(patchCtx, obj, mainOps...)
 			patchSpan.End()
 			if patchErr != nil {
-				return fmt.Errorf("spec patch operations failed: %w", patchErr)
+				return fmt.Errorf("main resource patch operations failed: %w", patchErr)
 			}
-			// The spec patch just bumped the stored generation (unified
+			// The patch may have just bumped the stored generation (unified
 			// storage increments it whenever spec changes, regardless of
 			// which endpoint the write came through). obj.Generation was
 			// captured once at the top of process and would otherwise be
@@ -1029,11 +1032,11 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 			patchErr := rc.statusPatcher.Patch(patchCtx, obj, statusOps...)
 			patchSpan.End()
 			if patchErr != nil {
-				return fmt.Errorf("status patch operations failed: %w", patchErr)
+				errs = append(errs, fmt.Errorf("status patch operations failed: %w", patchErr))
 			}
 		}
 
-		return nil
+		return errors.Join(errs...)
 	}
 	defer func() {
 		if patchErr := applyPatches(); patchErr != nil {
@@ -1385,7 +1388,7 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 	return repoType, nil
 }
 
-func (rc *RepositoryController) patchSpecOps(ctx context.Context, obj *provisioning.Repository, ops ...map[string]interface{}) (*provisioning.Repository, error) {
+func (rc *RepositoryController) patchMainResourceOps(ctx context.Context, obj *provisioning.Repository, ops ...map[string]interface{}) (*provisioning.Repository, error) {
 	patch, err := json.Marshal(ops)
 	if err != nil {
 		return nil, fmt.Errorf("unable to marshal spec patch data: %w", err)

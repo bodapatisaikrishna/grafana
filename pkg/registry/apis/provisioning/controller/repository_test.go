@@ -2485,6 +2485,13 @@ func TestRepositoryController_process_TokenRefreshedWhileOverQuota(t *testing.T)
 				},
 			}
 		},
+		repositoriesFunc: func(_ string) client.RepositoryInterface {
+			return mockRepoInterface{
+				patchFunc: func(_ context.Context, _ string, _ types.PatchType, _ []byte, _ metav1.PatchOptions, _ ...string) (*provisioning.Repository, error) {
+					return repo, nil
+				},
+			}
+		},
 	}
 
 	// The repo factory and health checker are reached.
@@ -2663,6 +2670,13 @@ func TestRepositoryController_process_RegeneratesTokenWhenSecretNotFound(t *test
 			return mockConnectionInterface{
 				getFunc: func(_ context.Context, _ string, _ metav1.GetOptions) (*provisioning.Connection, error) {
 					return connObj, nil
+				},
+			}
+		},
+		repositoriesFunc: func(_ string) client.RepositoryInterface {
+			return mockRepoInterface{
+				patchFunc: func(_ context.Context, _ string, _ types.PatchType, _ []byte, _ metav1.PatchOptions, _ ...string) (*provisioning.Repository, error) {
+					return repo, nil
 				},
 			}
 		},
@@ -3434,6 +3448,7 @@ func newRecoveryController(t *testing.T, repo *provisioning.Repository, stub *ho
 		statusPatcher: patcher,
 		repoFactory:   repoFactory,
 		jobs:          mockJobs,
+		client:        fakeclientset.NewSimpleClientset(repo).ProvisioningV0alpha1(),
 		logger:        logging.DefaultLogger.With("logger", loggerName),
 		tracer:        tracing.InitializeTracerForTest(),
 	}
@@ -3521,6 +3536,9 @@ func TestRepositoryController_process_BranchProtectionFailureStillRunsHooks(t *t
 		Status: provisioning.RepositoryStatus{
 			ObservedGeneration: 0, // first sync -> would otherwise run webhookOnCreate
 		},
+		Secure: provisioning.SecureValues{
+			Token: common.InlineSecureValue{Name: "existing-token"},
+		},
 	}
 
 	stub := &hookRepoStub{
@@ -3570,6 +3588,9 @@ func TestRepositoryController_process_WritePermissionDeniedStillRunsHooks(t *tes
 		},
 		Status: provisioning.RepositoryStatus{
 			ObservedGeneration: 0, // first sync -> would otherwise run webhookOnCreate
+		},
+		Secure: provisioning.SecureValues{
+			Token: common.InlineSecureValue{Name: "existing-token"},
 		},
 	}
 
@@ -3682,6 +3703,9 @@ func TestRepositoryController_process_QuotaBlockedButReachableStillRunsHooks(t *
 		Status: provisioning.RepositoryStatus{
 			ObservedGeneration: 0, // first sync -> would otherwise run webhookOnCreate
 		},
+		Secure: provisioning.SecureValues{
+			Token: common.InlineSecureValue{Name: "existing-token"},
+		},
 	}
 	// A second repo in the same namespace keeps the namespace over quota.
 	otherRepo := repo.DeepCopy()
@@ -3720,6 +3744,7 @@ func TestRepositoryController_process_QuotaBlockedButReachableStillRunsHooks(t *
 		statusPatcher: patcher,
 		repoFactory:   repoFactory,
 		jobs:          mockJobs,
+		client:        fakeclientset.NewSimpleClientset(repo).ProvisioningV0alpha1(),
 		logger:        logging.DefaultLogger.With("logger", loggerName),
 		tracer:        tracing.InitializeTracerForTest(),
 	}

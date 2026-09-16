@@ -2,8 +2,10 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,15 +13,19 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/grafana/grafana-app-sdk/logging"
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
 	"github.com/grafana/grafana/apps/provisioning/pkg/connection"
 	appcontroller "github.com/grafana/grafana/apps/provisioning/pkg/controller"
+	client "github.com/grafana/grafana/apps/provisioning/pkg/generated/clientset/versioned/typed/provisioning/v0alpha1"
 	common "github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
 	"github.com/grafana/grafana/pkg/infra/tracing"
 	"github.com/grafana/grafana/pkg/registry/apis/provisioning/informer"
@@ -50,6 +56,7 @@ type ConnectionController struct {
 	conns  informer.ConnectionGetter
 	logger logging.Logger
 
+	client            client.ProvisioningV0alpha1Interface
 	statusPatcher     ConnectionStatusPatcher
 	healthChecker     ConnectionHealthCheckerInterface
 	connectionFactory connection.Factory
@@ -73,6 +80,7 @@ type ConnectionController struct {
 // NewConnectionController creates a new ConnectionController.
 func NewConnectionController(
 	conns informer.ConnectionGetter,
+	client client.ProvisioningV0alpha1Interface,
 	statusPatcher ConnectionStatusPatcher,
 	healthChecker *ConnectionHealthChecker,
 	connectionFactory connection.Factory,
@@ -84,6 +92,7 @@ func NewConnectionController(
 ) *ConnectionController {
 	cc := &ConnectionController{
 		conns:     conns,
+		client:    client,
 		tracer:    tracer,
 		processed: usinformer.NewProcessedMetrics(registry, "connections", natsBacked),
 		triggers:  make(map[string]usinformer.ProcessTrigger),
@@ -473,20 +482,57 @@ func (cc *ConnectionController) process(ctx context.Context, key string) (err er
 	})
 
 	if len(patchOperations) > 0 {
-		// Update fieldErrors from test results
-		patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_status",
-			connSpanAttrs(conn),
-			trace.WithAttributes(attribute.Int("patch.operations", len(patchOperations))),
-		)
-		err := cc.statusPatcher.Patch(patchCtx, conn, patchOperations...)
-		patchSpan.End()
-		if err != nil {
-			return fmt.Errorf("failed to update connection status: %w", err)
+		var mainOps, statusOps []map[string]interface{}
+		for _, op := range patchOperations {
+			path, _ := op["path"].(string)
+			if strings.HasPrefix(path, "/status") {
+				statusOps = append(statusOps, op)
+			} else {
+				mainOps = append(mainOps, op)
+			}
+		}
+
+		if len(mainOps) > 0 {
+			patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_main",
+				connSpanAttrs(conn),
+				trace.WithAttributes(attribute.Int("patch.operations", len(mainOps))),
+			)
+			err := cc.patchMainResourceOps(patchCtx, conn, mainOps...)
+			patchSpan.End()
+			if err != nil {
+				return fmt.Errorf("main resource patch operations failed: %w", err)
+			}
+		}
+
+		if len(statusOps) > 0 {
+			patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_status",
+				connSpanAttrs(conn),
+				trace.WithAttributes(attribute.Int("patch.operations", len(statusOps))),
+			)
+			err := cc.statusPatcher.Patch(patchCtx, conn, statusOps...)
+			patchSpan.End()
+			if err != nil {
+				return fmt.Errorf("failed to update connection status: %w", err)
+			}
 		}
 	}
 
 	logger.Info("connection reconciled successfully", "healthy", healthStatus.Healthy)
 	return nil
+}
+
+func (cc *ConnectionController) patchMainResourceOps(ctx context.Context, conn *provisioning.Connection, ops ...map[string]interface{}) error {
+	patch, err := json.Marshal(ops)
+	if err != nil {
+		return fmt.Errorf("unable to marshal secure patch data: %w", err)
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		_, err := cc.client.Connections(conn.GetNamespace()).
+			Patch(ctx, conn.Name, types.JSONPatchType, patch, v1.PatchOptions{
+				FieldManager: "provisioning-controller",
+			})
+		return err
+	})
 }
 
 func (cc *ConnectionController) shouldGenerateToken(

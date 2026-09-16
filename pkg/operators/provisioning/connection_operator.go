@@ -56,6 +56,7 @@ func RunConnectionController(ctx context.Context, deps server.OperatorDependenci
 	connSource, connGetter := informer.NewConnectionDeltaSource(controllerCfg.natsSubscriber, provisioningClient, controllerCfg.ResyncInterval())
 	connController := controller.NewConnectionController(
 		connGetter,
+		provisioningClient.ProvisioningV0alpha1(),
 		statusPatcher,
 		controller.NewConnectionHealthChecker(
 			connection.NewSimpleConnectionTester(connectionFactory),
