@@ -42,7 +42,6 @@ import {
   logError,
 } from '@grafana/runtime';
 import {
-  getPanelPluginMetas,
   getFeatureFlagClient,
   FlagKeys,
   initDataSourceInstanceSettings,
@@ -339,8 +338,6 @@ export class GrafanaApp {
         preloadPlugins(await getAppPluginsToPreload());
         getPluginExtensionRegistries();
       }
-
-      await getPanelPluginMetas();
 
       setHelpNavItemHook(useHelpNode);
       setPluginLinksHook(usePluginLinks);
