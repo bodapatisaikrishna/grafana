@@ -965,14 +965,21 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 	shouldCheckHealth := rc.healthChecker.ShouldCheckHealth(obj)
 	hasSpecChanged := obj.Generation != obj.Status.ObservedGeneration
 	var patchOperations []map[string]interface{}
+	// Set below, once hook processing has run; read inside applyPatches after
+	// any spec op this pass has been applied. See the comment at its
+	// assignment for why the observedGeneration op can't be pre-built here.
+	var markObservedGeneration bool
 
 	// applyPatches flushes any patches not yet written
 	applyPatches := func() error {
-		if len(patchOperations) == 0 {
-			return nil
-		}
 		ops := patchOperations
 		patchOperations = nil
+		shouldMarkObserved := markObservedGeneration
+		markObservedGeneration = false
+
+		if len(ops) == 0 && !shouldMarkObserved {
+			return nil
+		}
 
 		var specOps, statusOps []map[string]interface{}
 		for _, op := range ops {
@@ -984,21 +991,34 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 			}
 		}
 
-		// Spec ops are applied first: a failed spec write (e.g. the repoID
-		// backfill's `test` op losing a stale-URL race) must not let this
-		// pass's status write - notably /status/observedGeneration - land
-		// anyway, or hasSpecChanged would go false and the backfill would
-		// not be retried on the very next reconcile.
+		// Spec ops are applied first: if spec write fails, we shouldn't update the observedGeneration
+		// otherwise on the next reconciliation, hasSpecChanged will be false even though it wasn't updated.
 		if len(specOps) > 0 {
 			patchCtx, patchSpan := rc.tracer.Start(ctx, "provisioning.controller.apply_spec",
 				repoSpanAttrs(obj),
 				trace.WithAttributes(attribute.Int("patch.operations", len(specOps))),
 			)
-			patchErr := rc.patchSpecOps(patchCtx, obj, specOps...)
+			patched, patchErr := rc.patchSpecOps(patchCtx, obj, specOps...)
 			patchSpan.End()
 			if patchErr != nil {
 				return fmt.Errorf("spec patch operations failed: %w", patchErr)
 			}
+			// The spec patch just bumped the stored generation (unified
+			// storage increments it whenever spec changes, regardless of
+			// which endpoint the write came through). obj.Generation was
+			// captured once at the top of process and would otherwise be
+			// stale by the time observedGeneration below is computed.
+			if patched != nil {
+				obj.Generation = patched.Generation
+			}
+		}
+
+		if shouldMarkObserved {
+			statusOps = append(statusOps, map[string]interface{}{
+				"op":    "replace",
+				"path":  "/status/observedGeneration",
+				"value": obj.Generation,
+			})
 		}
 
 		if len(statusOps) > 0 {
@@ -1295,13 +1315,10 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 	// observedGeneration, and since retries after this point only trigger on a
 	// generation mismatch or a missing webhook, that failure would never be
 	// retried once cooldown ends.
-	if hasSpecChanged && hookErr == nil && !hooksSuppressed {
-		patchOperations = append(patchOperations, map[string]interface{}{
-			"op":    "replace",
-			"path":  "/status/observedGeneration",
-			"value": obj.Generation,
-		})
-	}
+
+	// get latest observedGeneration after any additional spec changes have been applied
+	// during `applyPatches()`
+	markObservedGeneration = hasSpecChanged && hookErr == nil && !hooksSuppressed
 
 	// Build ALL condition patches together to avoid one overwriting another.
 	if conditionPatchOps := BuildConditionPatchOpsFromExisting(
@@ -1368,18 +1385,27 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 	return repoType, nil
 }
 
-func (rc *RepositoryController) patchSpecOps(ctx context.Context, obj *provisioning.Repository, ops ...map[string]interface{}) error {
+func (rc *RepositoryController) patchSpecOps(ctx context.Context, obj *provisioning.Repository, ops ...map[string]interface{}) (*provisioning.Repository, error) {
 	patch, err := json.Marshal(ops)
 	if err != nil {
-		return fmt.Errorf("unable to marshal spec patch data: %w", err)
+		return nil, fmt.Errorf("unable to marshal spec patch data: %w", err)
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		_, err := rc.client.Repositories(obj.GetNamespace()).
+	var patched *provisioning.Repository
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		re, err := rc.client.Repositories(obj.GetNamespace()).
 			Patch(ctx, obj.Name, types.JSONPatchType, patch, v1.PatchOptions{
 				FieldManager: "provisioning-controller",
 			})
-		return err
+		if err != nil {
+			return err
+		}
+		patched = re
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return patched, nil
 }
 
 // processHooks handles hook execution with intelligent retry logic. `suppressed`

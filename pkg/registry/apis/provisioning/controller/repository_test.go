@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,12 +16,15 @@ import (
 
 	"github.com/grafana/grafana-app-sdk/logging"
 	"github.com/prometheus/client_golang/prometheus"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
+	k8testing "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -1267,22 +1272,28 @@ func (s *repoIDHandlerStub) Test(context.Context) (*provisioning.TestResults, er
 func (s *repoIDHandlerStub) ResolvedRepoID() string   { return s.resolvedID }
 func (s *repoIDHandlerStub) ShouldUpdateRepoID() bool { return s.shouldUpdate }
 
-// countingStatusPatcher is a StatusPatcher that never fails, never inspects
-// its arguments, and records how many times Patch was called. Repository ID
-// backfill (like the default-branch backfill) is a spec write, and goes to
-// the main resource via rc.client instead of rc.statusPatcher - so this
-// test's fake clientset (which correctly implements RFC 6902 "test" op
-// semantics via evanphx/json-patch) is what simulates the race, not the
-// status patcher. The call count instead proves the ordering invariant in
-// applyPatches: a failed spec patch must short-circuit before the status
-// patch (e.g. the /status/observedGeneration bump) is ever attempted.
+// countingStatusPatcher is a StatusPatcher that records how many times Patch
+// was called, and - when client is set - actually applies the patch against
+// the status subresource so callers can observe the persisted result (e.g.
+// /status/observedGeneration). The call count proves the ordering invariant
+// in applyPatches: a failed spec patch must short-circuit before the status
+// patch is ever attempted.
 type countingStatusPatcher struct {
-	calls atomic.Int32
+	calls  atomic.Int32
+	client client.ProvisioningV0alpha1Interface
 }
 
-func (p *countingStatusPatcher) Patch(context.Context, *provisioning.Repository, ...map[string]interface{}) error {
+func (p *countingStatusPatcher) Patch(ctx context.Context, repo *provisioning.Repository, patchOperations ...map[string]interface{}) error {
 	p.calls.Add(1)
-	return nil
+	if p.client == nil {
+		return nil
+	}
+	patch, err := json.Marshal(patchOperations)
+	if err != nil {
+		return err
+	}
+	_, err = p.client.Repositories(repo.Namespace).Patch(ctx, repo.Name, types.JSONPatchType, patch, metav1.PatchOptions{}, "status")
+	return err
 }
 
 // TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL verifies
@@ -1357,13 +1368,65 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 			// is what simulates the race here.
 			fakeClientset := fakeclientset.NewSimpleClientset(storage)
 
+			// The plain fake clientset doesn't bump Generation on a spec
+			// change the way the real unified storage backend does (see
+			// pkg/storage/unified/apistore/prepare.go). Mirror that one
+			// behavior here so this test can exercise the exact staleness
+			// scenario a real spec-changing PATCH produces: obj.Generation
+			// (captured once at the top of process) must be refreshed from
+			// the patch response, or /status/observedGeneration ends up
+			// wrong relative to the server's actual generation.
+			fakeClientset.PrependReactor("patch", "repositories", func(action k8testing.Action) (bool, runtime.Object, error) {
+				patchAction, ok := action.(k8testing.PatchAction)
+				if !ok || patchAction.GetSubresource() != "" {
+					return false, nil, nil
+				}
+
+				tracker := fakeClientset.Tracker()
+				gvr := action.GetResource()
+				existingObj, err := tracker.Get(gvr, patchAction.GetNamespace(), patchAction.GetName())
+				if err != nil {
+					return true, nil, err
+				}
+				existing, ok := existingObj.(*provisioning.Repository)
+				if !ok {
+					return true, nil, fmt.Errorf("unexpected type %T", existingObj)
+				}
+
+				oldBytes, err := json.Marshal(existing)
+				if err != nil {
+					return true, nil, err
+				}
+				patch, err := jsonpatch.DecodePatch(patchAction.GetPatch())
+				if err != nil {
+					return true, nil, err
+				}
+				newBytes, err := patch.Apply(oldBytes)
+				if err != nil {
+					return true, nil, err // preserves "test" op failure semantics
+				}
+				updated := &provisioning.Repository{}
+				if err := json.Unmarshal(newBytes, updated); err != nil {
+					return true, nil, err
+				}
+
+				if !reflect.DeepEqual(existing.Spec, updated.Spec) {
+					updated.Generation = existing.Generation + 1
+				}
+
+				if err := tracker.Update(gvr, updated, patchAction.GetNamespace()); err != nil {
+					return true, nil, err
+				}
+				return true, updated, nil
+			})
+
 			healthMetrics := NewMockHealthMetricsRecorder(t)
 			healthMetrics.EXPECT().
 				RecordHealthCheck(mock.Anything, mock.Anything, mock.Anything).
 				Maybe()
 
 			tester := repository.NewTester()
-			patcher := &countingStatusPatcher{}
+			patcher := &countingStatusPatcher{client: fakeClientset.ProvisioningV0alpha1()}
 			healthChecker := NewRepositoryHealthChecker(patcher, tester, healthMetrics)
 
 			mockRepo := &repoIDHandlerStub{
@@ -1418,9 +1481,19 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 			if tc.wantErr {
 				assert.Equal(t, int32(0), patcher.calls.Load(),
 					"a failed spec patch must prevent the status patch (e.g. the observedGeneration bump) from being applied this pass")
+				assert.EqualValues(t, 0, updated.Status.ObservedGeneration,
+					"a failed spec patch must leave observedGeneration untouched")
 			} else {
 				assert.Greater(t, patcher.calls.Load(), int32(0),
 					"a successful spec patch should be followed by the status patch")
+				// The repoID backfill bumped Generation server-side; observedGeneration
+				// must reflect that fresh value, not the one obj had when process()
+				// first read it - otherwise the next reconcile sees a spurious
+				// mismatch and treats spec as changed again for no reason.
+				assert.Equal(t, updated.Generation, updated.Status.ObservedGeneration,
+					"observedGeneration must match the generation actually produced by this pass's spec patch")
+				assert.EqualValues(t, 2, updated.Generation,
+					"the repoID backfill should have bumped generation by exactly one")
 			}
 		})
 	}
