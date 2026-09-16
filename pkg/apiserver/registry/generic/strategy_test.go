@@ -504,6 +504,6 @@ func (o *testSecureObj) DeepCopyObject() runtime.Object {
 		return nil
 	}
 	out := *o
-	out.ObjectMeta = *o.ObjectMeta.DeepCopy()
+	out.ObjectMeta = *o.DeepCopy()
 	return &out
 }

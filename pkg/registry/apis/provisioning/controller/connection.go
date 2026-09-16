@@ -481,43 +481,60 @@ func (cc *ConnectionController) process(ctx context.Context, key string) (err er
 		"value": fieldErrors,
 	})
 
-	if len(patchOperations) > 0 {
-		var mainOps, statusOps []map[string]interface{}
-		for _, op := range patchOperations {
-			path, _ := op["path"].(string)
-			if strings.HasPrefix(path, "/status") {
-				statusOps = append(statusOps, op)
-			} else {
-				mainOps = append(mainOps, op)
-			}
-		}
-
-		if len(mainOps) > 0 {
-			patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_main",
-				connSpanAttrs(conn),
-				trace.WithAttributes(attribute.Int("patch.operations", len(mainOps))),
-			)
-			err := cc.patchMainResourceOps(patchCtx, conn, mainOps...)
-			patchSpan.End()
-			if err != nil {
-				return fmt.Errorf("main resource patch operations failed: %w", err)
-			}
-		}
-
-		if len(statusOps) > 0 {
-			patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_status",
-				connSpanAttrs(conn),
-				trace.WithAttributes(attribute.Int("patch.operations", len(statusOps))),
-			)
-			err := cc.statusPatcher.Patch(patchCtx, conn, statusOps...)
-			patchSpan.End()
-			if err != nil {
-				return fmt.Errorf("failed to update connection status: %w", err)
-			}
-		}
+	if err := cc.applyPatchOperations(ctx, conn, patchOperations); err != nil {
+		return err
 	}
 
 	logger.Info("connection reconciled successfully", "healthy", healthStatus.Healthy)
+	return nil
+}
+
+// applyPatchOperations splits patchOperations into main-resource ops (spec,
+// secure) and status ops, then applies the main-resource ops first: admission
+// skips validation entirely for a subresource (status) request, so a spec or
+// secure change riding along in the status batch would never be checked. If
+// the main-resource write fails, the status write must not run either -
+// otherwise status could claim a change (e.g. a token refresh) that never
+// actually landed.
+func (cc *ConnectionController) applyPatchOperations(ctx context.Context, conn *provisioning.Connection, patchOperations []map[string]interface{}) error {
+	if len(patchOperations) == 0 {
+		return nil
+	}
+
+	var mainOps, statusOps []map[string]interface{}
+	for _, op := range patchOperations {
+		path, _ := op["path"].(string)
+		if strings.HasPrefix(path, "/status") {
+			statusOps = append(statusOps, op)
+		} else {
+			mainOps = append(mainOps, op)
+		}
+	}
+
+	if len(mainOps) > 0 {
+		patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_main",
+			connSpanAttrs(conn),
+			trace.WithAttributes(attribute.Int("patch.operations", len(mainOps))),
+		)
+		err := cc.patchMainResourceOps(patchCtx, conn, mainOps...)
+		patchSpan.End()
+		if err != nil {
+			return fmt.Errorf("main resource patch operations failed: %w", err)
+		}
+	}
+
+	if len(statusOps) > 0 {
+		patchCtx, patchSpan := cc.tracer.Start(ctx, "provisioning.controller.apply_status",
+			connSpanAttrs(conn),
+			trace.WithAttributes(attribute.Int("patch.operations", len(statusOps))),
+		)
+		err := cc.statusPatcher.Patch(patchCtx, conn, statusOps...)
+		patchSpan.End()
+		if err != nil {
+			return fmt.Errorf("failed to update connection status: %w", err)
+		}
+	}
+
 	return nil
 }
 
