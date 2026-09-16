@@ -30,6 +30,10 @@ func NewAdmissionMutator(factory Factory) *AdmissionMutator {
 
 // Mutate applies mutations to Connection resources
 func (m *AdmissionMutator) Mutate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	if a.GetSubresource() != "" {
+		return nil // status (and other subresource) patches don't touch spec and shouldn't re-run spec mutations
+	}
+
 	obj := a.GetObject()
 	if obj == nil {
 		return nil

@@ -18,6 +18,10 @@ import (
 )
 
 func newMutatorTestAttributes(obj, old runtime.Object, op admission.Operation) admission.Attributes {
+	return newMutatorTestAttributesWithSubresource(obj, old, op, "")
+}
+
+func newMutatorTestAttributesWithSubresource(obj, old runtime.Object, op admission.Operation, subresource string) admission.Attributes {
 	return admission.NewAttributesRecord(
 		obj,
 		old,
@@ -25,7 +29,7 @@ func newMutatorTestAttributes(obj, old runtime.Object, op admission.Operation) a
 		"default",
 		"test",
 		provisioning.ConnectionResourceInfo.GroupVersionResource(),
-		"",
+		subresource,
 		op,
 		nil,
 		false,
@@ -254,6 +258,22 @@ func TestAdmissionMutator_MutateUpdateOAuthToken(t *testing.T) {
 			assert.Equal(t, tt.wantToken, obj.Secure.Token)
 		})
 	}
+}
+
+func TestAdmissionMutator_Mutate_SkipsSubresourcePatches(t *testing.T) {
+	factory := NewMockFactory(t)
+	// No EXPECT() set up for Mutate: the mock will fail the test if it's called,
+	// confirming extras never run for status patches.
+
+	conn := &provisioning.Connection{
+		ObjectMeta: metav1.ObjectMeta{Name: "test"},
+		Spec:       provisioning.ConnectionSpec{Type: provisioning.GithubConnectionType},
+	}
+
+	m := NewAdmissionMutator(factory)
+	attr := newMutatorTestAttributesWithSubresource(conn, nil, admission.Update, "status")
+
+	require.NoError(t, m.Mutate(t.Context(), attr, nil))
 }
 
 func githubEnterpriseConfig(serverURL string) *provisioning.GitHubEnterpriseOAuthConnectionConfig {
