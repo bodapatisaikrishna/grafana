@@ -1013,6 +1013,7 @@ func (rc *RepositoryController) process(key string) (repoType string, err error)
 			// stale by the time observedGeneration below is computed.
 			if patched != nil {
 				obj.Generation = patched.Generation
+				RebindConditionGeneration(statusOps, obj.Generation)
 			}
 		}
 

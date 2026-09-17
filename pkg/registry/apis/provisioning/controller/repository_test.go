@@ -1494,6 +1494,16 @@ func TestRepositoryController_process_RepoIDBackfillGuardsAgainstStaleURL(t *tes
 					"observedGeneration must match the generation actually produced by this pass's spec patch")
 				assert.EqualValues(t, 2, updated.Generation,
 					"the repoID backfill should have bumped generation by exactly one")
+
+				// The Ready/NamespaceQuota conditions were built earlier in this same
+				// pass, before the repoID backfill bumped generation - they must not
+				// persist stamped with the stale, pre-backfill generation while
+				// observedGeneration above advances to the new one.
+				for _, c := range updated.Status.Conditions {
+					assert.Equal(t, updated.Generation, c.ObservedGeneration,
+						"condition %q must be stamped with the post-backfill generation", c.Type)
+				}
+				assert.NotEmpty(t, updated.Status.Conditions, "expected conditions to have been written this pass")
 			}
 		})
 	}
