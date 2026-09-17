@@ -44,11 +44,14 @@ var (
 )
 
 type DataSourceAPIBuilderConfig struct {
-	LoadQueryTypes              bool
-	LoadOpenAPISpec             bool
-	UseDualWriter               bool
-	EnableResourceEndpoint      bool
-	EnableHealthEndpoint        bool
+	LoadQueryTypes         bool
+	LoadOpenAPISpec        bool
+	UseDualWriter          bool
+	EnableResourceEndpoint bool
+	EnableHealthEndpoint   bool
+	// EnableAccessEndpoint exposes an MT-safe /access endpoint. Unlike the
+	// legacy endpoint, it asks the configured AccessClient for each capability.
+	EnableAccessEndpoint        bool
 	EnableChunkedQueryStreaming bool
 
 	// HandlerOrigin, when non-empty, is written as the X-Grafana-DS-Apiserver
@@ -314,9 +317,6 @@ func (b *DataSourceAPIBuilder) UpdateAPIGroupInfo(apiGroupInfo *genericapiserver
 			return err
 		}
 		storage[ds.StoragePath()] = b.store
-		storage[ds.StoragePath("access")] = &subAccessREST{
-			builder: b,
-		}
 	} else {
 		// Read only datasources
 		storage[ds.StoragePath()] = &connectionAccess{
@@ -324,6 +324,12 @@ func (b *DataSourceAPIBuilder) UpdateAPIGroupInfo(apiGroupInfo *genericapiserver
 			resourceInfo:   ds,
 			tableConverter: ds.TableConverter(),
 		}
+	}
+
+	if b.cfg.EnableAccessEndpoint {
+		storage[ds.StoragePath("access")] = &subAccessAuthzREST{builder: b}
+	} else if b.cfg.UseDualWriter {
+		storage[ds.StoragePath("access")] = &subAccessREST{builder: b}
 	}
 
 	// Frontend proxy
